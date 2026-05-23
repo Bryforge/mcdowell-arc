@@ -31,7 +31,7 @@ class Observations:
     sigma_altitude_km: np.ndarray
     sigma_speed_km_s: np.ndarray
 
-    def validated(self) -> "Observations":
+    def validated(self) -> Observations:
         arrays = {
             "t_s": np.asarray(self.t_s, dtype=float),
             "altitude_km": np.asarray(self.altitude_km, dtype=float),
@@ -69,7 +69,7 @@ class FitOptions:
     max_step_s: float = 1.0
     max_nfev: int = 35
 
-    def validated(self) -> "FitOptions":
+    def validated(self) -> FitOptions:
         validate_backend(self.backend)
         if self.max_step_s <= 0 or not np.isfinite(self.max_step_s):
             raise ValueError("max_step_s must be positive and finite.")
