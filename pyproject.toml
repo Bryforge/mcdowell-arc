@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mcdowell-arc"
-version = "0.1.0"
-description = "Drag-aware ECI webcast trajectory fitting with uncertainty bounds."
+version = "0.2.0"
+description = "Drag-aware ECI webcast trajectory fitting with uncertainty bounds and optional Rust core."
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{ name = "Bryforge" }]
@@ -14,6 +14,14 @@ dependencies = [
   "numpy>=1.24",
   "scipy>=1.10",
   "pandas>=2.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "build>=1.2",
+  "maturin>=1.8"
 ]
 
 [project.scripts]
@@ -25,3 +33,12 @@ where = ["src"]
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]

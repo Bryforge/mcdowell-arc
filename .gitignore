@@ -7,3 +7,10 @@ build/
 *.egg-info/
 .env
 .DS_Store
+.ruff_cache/
+.mypy_cache/
+target/
+*.so
+*.dylib
+*.dll
+profile.out

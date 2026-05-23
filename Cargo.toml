@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/mcdowell-arc-core"]
+resolver = "2"

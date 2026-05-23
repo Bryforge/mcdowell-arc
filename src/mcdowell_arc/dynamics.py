@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import numpy as np
+
 from .atmosphere import density_kg_m3
 from .constants import MU_EARTH_KM3_S2, R_EARTH_KM
+from .fast import propagate_core, resolve_backend, validate_backend
 from .frames import earth_rotation_velocity_km_s
 
 
@@ -16,14 +18,17 @@ def acceleration_km_s2(
 ) -> np.ndarray:
     """Compute gravity plus drag acceleration for a 6-state vector.
 
-    ballistic_coef_kg_m2 is beta = mass / (Cd * area). Larger beta means less drag.
+    `ballistic_coef_kg_m2` is beta = mass / (Cd * area). Larger beta means less drag.
     """
     del t_s
-    r = np.asarray(state[:3], dtype=float)
-    v = np.asarray(state[3:], dtype=float)
+    state = np.asarray(state, dtype=float)
+    if state.shape != (6,):
+        raise ValueError("state must be a 6-element vector [x,y,z,vx,vy,vz].")
+    r = state[:3]
+    v = state[3:]
     r_norm = np.linalg.norm(r)
-    if r_norm <= 0:
-        raise ValueError("Position norm must be positive.")
+    if r_norm <= 0 or not np.isfinite(r_norm):
+        raise ValueError("Position norm must be positive and finite.")
 
     a_gravity = -MU_EARTH_KM3_S2 * r / r_norm**3
     if not use_drag:
@@ -33,13 +38,16 @@ def acceleration_km_s2(
     rho = density_kg_m3(alt_km)
     v_atm = earth_rotation_velocity_km_s(r)
     v_rel_km_s = v - v_atm
-    v_rel_m_s = np.linalg.norm(v_rel_km_s) * 1000.0
+    v_rel_norm_km_s = np.linalg.norm(v_rel_km_s)
+    v_rel_m_s = v_rel_norm_km_s * 1000.0
 
     if v_rel_m_s <= 0.0 or ballistic_coef_kg_m2 <= 0.0:
         return a_gravity
 
     # Drag acceleration magnitude: 0.5 * rho * v^2 / beta in m/s^2.
-    a_drag_m_s2_vec = -0.5 * rho * v_rel_m_s**2 / ballistic_coef_kg_m2 * (v_rel_km_s / np.linalg.norm(v_rel_km_s))
+    a_drag_m_s2_vec = -0.5 * rho * v_rel_m_s**2 / ballistic_coef_kg_m2 * (
+        v_rel_km_s / v_rel_norm_km_s
+    )
     a_drag_km_s2 = a_drag_m_s2_vec / 1000.0
     return a_gravity + a_drag_km_s2
 
@@ -58,27 +66,30 @@ def _rk4_step(t_s: float, state: np.ndarray, dt_s: float, ballistic_coef_kg_m2: 
     return state + (dt_s / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
 
 
-def propagate(
+def _propagate_python(
     sample_times_s: np.ndarray,
     state0: np.ndarray,
     ballistic_coef_kg_m2: float,
     use_drag: bool = True,
     max_step_s: float = 1.0,
 ) -> np.ndarray:
-    """Propagate state0 to the requested sample times using fixed-step RK4.
-
-    The fixed-step integrator is deliberately predictable for fitting. Impossible
-    trial states that dive below 50 km are rejected quickly.
-    """
+    """Pure-Python/NumPy propagation implementation."""
     times = np.asarray(sample_times_s, dtype=float)
     if times.ndim != 1 or len(times) == 0:
         raise ValueError("sample_times_s must be a non-empty 1-D array.")
+    if not np.all(np.isfinite(times)):
+        raise ValueError("sample_times_s must contain finite values.")
     if np.any(np.diff(times) < 0):
         raise ValueError("sample_times_s must be sorted ascending.")
-    if max_step_s <= 0:
-        raise ValueError("max_step_s must be positive.")
+    if max_step_s <= 0 or not np.isfinite(max_step_s):
+        raise ValueError("max_step_s must be positive and finite.")
 
     state = np.asarray(state0, dtype=float).copy()
+    if state.shape != (6,):
+        raise ValueError("state0 must be a 6-element vector [x,y,z,vx,vy,vz].")
+    if not np.all(np.isfinite(state)):
+        raise ValueError("state0 must contain only finite values.")
+
     out = [state.copy()]
     t_current = float(times[0])
 
@@ -95,3 +106,23 @@ def propagate(
         out.append(state.copy())
 
     return np.vstack(out)
+
+
+def propagate(
+    sample_times_s: np.ndarray,
+    state0: np.ndarray,
+    ballistic_coef_kg_m2: float,
+    use_drag: bool = True,
+    max_step_s: float = 1.0,
+    backend: str = "auto",
+) -> np.ndarray:
+    """Propagate state0 to the requested sample times using fixed-step RK4.
+
+    `backend="auto"` uses the Rust core when installed and falls back to the
+    Python implementation otherwise. `backend="rust"` fails clearly when the
+    extension is unavailable.
+    """
+    selected = validate_backend(backend)
+    if resolve_backend(selected) == "rust":
+        return propagate_core(sample_times_s, state0, ballistic_coef_kg_m2, use_drag, max_step_s)
+    return _propagate_python(sample_times_s, state0, ballistic_coef_kg_m2, use_drag, max_step_s)

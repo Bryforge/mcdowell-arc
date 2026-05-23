@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -10,17 +11,71 @@ from scipy.optimize import least_squares
 
 from .constants import R_EARTH_KM
 from .dynamics import propagate
+from .fast import validate_backend
 from .frames import earth_rotation_velocity_km_s
 from .orbit import OrbitSummary, summarize_orbit
 
 
 @dataclass(frozen=True)
 class Observations:
+    """Webcast-style trajectory observations.
+
+    The MVP observation format intentionally contains only time, altitude, and
+    Earth-relative speed. That makes it useful for public webcast telemetry, but
+    it is underconstrained compared with real tracking geometry.
+    """
+
     t_s: np.ndarray
     altitude_km: np.ndarray
     speed_km_s: np.ndarray
     sigma_altitude_km: np.ndarray
     sigma_speed_km_s: np.ndarray
+
+    def validated(self) -> "Observations":
+        arrays = {
+            "t_s": np.asarray(self.t_s, dtype=float),
+            "altitude_km": np.asarray(self.altitude_km, dtype=float),
+            "speed_km_s": np.asarray(self.speed_km_s, dtype=float),
+            "sigma_altitude_km": np.asarray(self.sigma_altitude_km, dtype=float),
+            "sigma_speed_km_s": np.asarray(self.sigma_speed_km_s, dtype=float),
+        }
+        length = len(arrays["t_s"])
+        if length < 3:
+            raise ValueError("At least three observations are required for fitting.")
+        for name, values in arrays.items():
+            if values.ndim != 1:
+                raise ValueError(f"{name} must be a 1-D array.")
+            if len(values) != length:
+                raise ValueError(f"{name} length must match t_s length.")
+            if not np.all(np.isfinite(values)):
+                raise ValueError(f"{name} must contain only finite values.")
+        if np.any(np.diff(arrays["t_s"]) <= 0):
+            raise ValueError("t_s must be strictly increasing after sorting.")
+        if np.any(arrays["altitude_km"] < -1.0):
+            raise ValueError("altitude_km contains values below the accepted guard band.")
+        if np.any(arrays["speed_km_s"] <= 0.0):
+            raise ValueError("speed_km_s must be positive.")
+        if np.any(arrays["sigma_altitude_km"] <= 0.0) or np.any(arrays["sigma_speed_km_s"] <= 0.0):
+            raise ValueError("uncertainty columns must be positive.")
+        return Observations(**arrays)
+
+
+@dataclass(frozen=True)
+class FitOptions:
+    """Controls for deterministic fitting and propagation."""
+
+    use_drag: bool = True
+    backend: str = "auto"
+    max_step_s: float = 1.0
+    max_nfev: int = 35
+
+    def validated(self) -> "FitOptions":
+        validate_backend(self.backend)
+        if self.max_step_s <= 0 or not np.isfinite(self.max_step_s):
+            raise ValueError("max_step_s must be positive and finite.")
+        if self.max_nfev <= 0:
+            raise ValueError("max_nfev must be positive.")
+        return self
 
 
 @dataclass(frozen=True)
@@ -34,8 +89,15 @@ class FitResult:
     message: str
 
 
-def load_observations_csv(path: str) -> Observations:
-    """Load webcast-style observations from CSV."""
+def _numeric_series(df: pd.DataFrame, column: str) -> np.ndarray:
+    try:
+        return pd.to_numeric(df[column], errors="raise").to_numpy(float)
+    except Exception as exc:
+        raise ValueError(f"CSV column {column!r} must be numeric.") from exc
+
+
+def load_observations_csv(path: str | Path) -> Observations:
+    """Load webcast-style observations from CSV and validate them."""
     df = pd.read_csv(path)
     required = {"t_s", "altitude_km", "speed_km_s"}
     missing = sorted(required - set(df.columns))
@@ -43,20 +105,21 @@ def load_observations_csv(path: str) -> Observations:
         raise ValueError(f"Missing required CSV columns: {', '.join(missing)}")
 
     df = df.sort_values("t_s").reset_index(drop=True)
-    sigma_alt = df["sigma_altitude_km"].to_numpy(float) if "sigma_altitude_km" in df else np.full(len(df), 3.0)
-    sigma_speed = df["sigma_speed_km_s"].to_numpy(float) if "sigma_speed_km_s" in df else np.full(len(df), 0.05)
+    sigma_alt = _numeric_series(df, "sigma_altitude_km") if "sigma_altitude_km" in df else np.full(len(df), 3.0)
+    sigma_speed = _numeric_series(df, "sigma_speed_km_s") if "sigma_speed_km_s" in df else np.full(len(df), 0.05)
     sigma_alt = np.where(sigma_alt > 0, sigma_alt, 3.0)
     sigma_speed = np.where(sigma_speed > 0, sigma_speed, 0.05)
 
-    t = df["t_s"].to_numpy(float)
+    t = _numeric_series(df, "t_s")
     t = t - t[0]
-    return Observations(
+    obs = Observations(
         t_s=t,
-        altitude_km=df["altitude_km"].to_numpy(float),
-        speed_km_s=df["speed_km_s"].to_numpy(float),
+        altitude_km=_numeric_series(df, "altitude_km"),
+        speed_km_s=_numeric_series(df, "speed_km_s"),
         sigma_altitude_km=sigma_alt,
         sigma_speed_km_s=sigma_speed,
     )
+    return obs.validated()
 
 
 def _params_to_state(params: np.ndarray, obs: Observations) -> tuple[np.ndarray, float]:
@@ -72,6 +135,7 @@ def _params_to_state(params: np.ndarray, obs: Observations) -> tuple[np.ndarray,
 
 def observables_from_states(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Compute altitude and Earth-relative speed from propagated ECI states."""
+    states = np.asarray(states, dtype=float)
     r = states[:, :3]
     v = states[:, 3:]
     altitude = np.linalg.norm(r, axis=1) - R_EARTH_KM
@@ -80,11 +144,18 @@ def observables_from_states(states: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return altitude, rel_speed
 
 
-def residuals(params: np.ndarray, obs: Observations, use_drag: bool = True) -> np.ndarray:
+def residuals(params: np.ndarray, obs: Observations, options: FitOptions) -> np.ndarray:
     """Weighted residual vector for least-squares fitting."""
     state0, beta = _params_to_state(params, obs)
     try:
-        states = propagate(obs.t_s, state0, beta, use_drag=use_drag)
+        states = propagate(
+            obs.t_s,
+            state0,
+            beta,
+            use_drag=options.use_drag,
+            max_step_s=options.max_step_s,
+            backend=options.backend,
+        )
         alt_model, speed_model = observables_from_states(states)
     except Exception:
         # Penalize impossible trial states without crashing the optimizer.
@@ -100,6 +171,7 @@ def residuals(params: np.ndarray, obs: Observations, use_drag: bool = True) -> n
 
 def initial_guess(obs: Observations) -> np.ndarray:
     """Build a simple first guess near the first observation."""
+    obs = obs.validated()
     if len(obs.t_s) >= 2 and obs.t_s[-1] > obs.t_s[0]:
         vr_guess = np.gradient(obs.altitude_km, obs.t_s)[0]
     else:
@@ -117,8 +189,12 @@ def fit_observations(
     use_drag: bool = True,
     initial_params: np.ndarray | None = None,
     max_nfev: int = 35,
+    backend: str = "auto",
+    max_step_s: float = 1.0,
 ) -> FitResult:
     """Fit a reduced 2-D drag-aware ECI trajectory."""
+    obs = obs.validated()
+    options = FitOptions(use_drag=use_drag, backend=backend, max_step_s=max_step_s, max_nfev=max_nfev).validated()
     x0 = initial_guess(obs) if initial_params is None else np.asarray(initial_params, dtype=float)
     bounds = (
         np.array([-100.0, -5.0, 0.1, np.log(10.0)]),
@@ -128,15 +204,15 @@ def fit_observations(
         residuals,
         x0=x0,
         bounds=bounds,
-        args=(obs, use_drag),
+        args=(obs, options),
         loss="soft_l1",
         f_scale=2.0,
-        max_nfev=max_nfev,
+        max_nfev=options.max_nfev,
         x_scale=np.array([10.0, 1.0, 1.0, 2.0]),
     )
     state0, beta = _params_to_state(opt.x, obs)
     orbit = summarize_orbit(state0)
-    res = residuals(opt.x, obs, use_drag=use_drag)
+    res = residuals(opt.x, obs, options)
     return FitResult(
         state0=state0,
         ballistic_coef_kg_m2=beta,
@@ -154,10 +230,15 @@ def monte_carlo(
     atmosphere_threshold_km: float = 100.0,
     seed: int = 7,
     use_drag: bool = True,
+    backend: str = "auto",
+    max_step_s: float = 1.0,
 ) -> dict:
     """Perturb observations by their sigmas and refit many times."""
+    obs = obs.validated()
+    if samples <= 0:
+        raise ValueError("samples must be positive.")
     rng = np.random.default_rng(seed)
-    nominal = fit_observations(obs, use_drag=use_drag)
+    nominal = fit_observations(obs, use_drag=use_drag, backend=backend, max_step_s=max_step_s)
     perigees: list[float] = []
     apogees: list[float] = []
     betas: list[float] = []
@@ -170,15 +251,24 @@ def monte_carlo(
             speed_km_s=obs.speed_km_s + rng.normal(0.0, obs.sigma_speed_km_s),
             sigma_altitude_km=obs.sigma_altitude_km.copy(),
             sigma_speed_km_s=obs.sigma_speed_km_s.copy(),
-        )
+        ).validated()
         try:
-            warm_start = np.array([
-                nominal.state0[0] - (R_EARTH_KM + perturbed.altitude_km[0]),
-                nominal.state0[3],
-                nominal.state0[4],
-                np.log(nominal.ballistic_coef_kg_m2),
-            ])
-            fit = fit_observations(perturbed, use_drag=use_drag, initial_params=warm_start, max_nfev=18)
+            warm_start = np.array(
+                [
+                    nominal.state0[0] - (R_EARTH_KM + perturbed.altitude_km[0]),
+                    nominal.state0[3],
+                    nominal.state0[4],
+                    np.log(nominal.ballistic_coef_kg_m2),
+                ]
+            )
+            fit = fit_observations(
+                perturbed,
+                use_drag=use_drag,
+                initial_params=warm_start,
+                max_nfev=18,
+                backend=backend,
+                max_step_s=max_step_s,
+            )
             perigees.append(fit.orbit.perigee_km)
             if fit.orbit.apogee_km is not None:
                 apogees.append(fit.orbit.apogee_km)
