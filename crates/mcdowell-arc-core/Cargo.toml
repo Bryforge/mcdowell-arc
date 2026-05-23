@@ -1,0 +1,18 @@
+[package]
+name = "mcdowell-arc-core"
+version = "0.2.0"
+edition = "2021"
+description = "Fast Rust core for McDowell Arc trajectory propagation and orbit summaries."
+license = "MIT"
+
+[lib]
+name = "mcdowell_arc_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["extension-module"] }
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
+opt-level = 3
